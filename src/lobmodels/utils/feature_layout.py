@@ -7,12 +7,17 @@ Converts between different LOB feature layouts to enable:
 
 Layout Definitions:
 
-    GROUPED (Our Rust pipeline output):
-        [bid_prices(L), ask_prices(L), bid_sizes(L), ask_sizes(L)]
-        Indices: bid_p[0:L], ask_p[L:2L], bid_s[2L:3L], ask_s[3L:4L]
+    GROUPED (Our Rust pipeline output - from feature-extractor-MBO-LOB):
+        [ask_prices(L), ask_sizes(L), bid_prices(L), bid_sizes(L)]
+        Indices: ask_p[0:L], ask_s[L:2L], bid_p[2L:3L], bid_s[3L:4L]
         Total: 4L features (40 for L=10)
+        
+        This layout groups by SIDE first (ask, then bid), then by TYPE (prices, then sizes).
+        Matches FI-2010 convention where ask comes before bid.
+        
+        Spread Invariant: features[0] > features[2L] (ask_price_L0 > bid_price_L0)
     
-    FI2010 (Original DeepLOB paper):
+    FI2010 (Original DeepLOB paper, Section III.C):
         For each level: [price_ask, volume_ask, price_bid, volume_bid]
         [p_a0, v_a0, p_b0, v_b0, p_a1, v_a1, p_b1, v_b1, ..., p_a9, v_a9, p_b9, v_b9]
         Total: 4L features (40 for L=10)
@@ -40,8 +45,10 @@ def rearrange_grouped_to_fi2010(
     """
     Rearrange features from GROUPED layout to FI2010 layout.
     
-    GROUPED:  [bid_p(L), ask_p(L), bid_s(L), ask_s(L)]
+    GROUPED:  [ask_p(L), ask_s(L), bid_p(L), bid_s(L)]
+              (Rust pipeline output - groups by side, then type)
     FI2010:   [p_a0, v_a0, p_b0, v_b0, ..., p_aL-1, v_aL-1, p_bL-1, v_bL-1]
+              (DeepLOB paper - interleaves per level)
     
     Args:
         x: Input tensor of shape [..., 4*num_levels]
@@ -60,6 +67,12 @@ def rearrange_grouped_to_fi2010(
     
     Note:
         This is a pure permutation - no values are modified, only reordered.
+        
+    Spread Invariant (input):
+        x[..., 0] > x[..., 2*L] (ask_price_L0 > bid_price_L0)
+    
+    Spread Invariant (output):
+        result[..., 0] > result[..., 2] (p_a0 > p_b0)
     """
     L = num_levels
     expected_features = 4 * L
@@ -70,21 +83,23 @@ def rearrange_grouped_to_fi2010(
             f"got {x.shape[-1]}"
         )
     
-    # Extract grouped components
-    # GROUPED layout: [bid_p(0:L), ask_p(L:2L), bid_s(2L:3L), ask_s(3L:4L)]
-    bid_prices = x[..., 0:L]        # [*, L]
-    ask_prices = x[..., L:2*L]      # [*, L]
-    bid_sizes = x[..., 2*L:3*L]     # [*, L]
-    ask_sizes = x[..., 3*L:4*L]     # [*, L]
+    # Extract grouped components from Rust pipeline output
+    # GROUPED layout: [ask_p(0:L), ask_s(L:2L), bid_p(2L:3L), bid_s(3L:4L)]
+    # Source: feature-extractor-MBO-LOB/CODEBASE.md §4, lob_features.rs
+    ask_prices = x[..., 0:L]        # [*, L] - indices 0-9
+    ask_sizes = x[..., L:2*L]       # [*, L] - indices 10-19
+    bid_prices = x[..., 2*L:3*L]    # [*, L] - indices 20-29
+    bid_sizes = x[..., 3*L:4*L]     # [*, L] - indices 30-39
     
     # Build FI2010 layout: for each level, [p_ask, v_ask, p_bid, v_bid]
-    # Stack per level then interleave
+    # This matches DeepLOB paper Section III.C:
+    # "xₜ = [p_a⁽ⁱ⁾(t), v_a⁽ⁱ⁾(t), p_b⁽ⁱ⁾(t), v_b⁽ⁱ⁾(t)]ᵢ₌₁ⁿ⁼¹⁰"
     levels = []
     for i in range(L):
-        levels.append(ask_prices[..., i:i+1])  # p_ask
-        levels.append(ask_sizes[..., i:i+1])   # v_ask
-        levels.append(bid_prices[..., i:i+1])  # p_bid
-        levels.append(bid_sizes[..., i:i+1])   # v_bid
+        levels.append(ask_prices[..., i:i+1])  # p_ask at level i
+        levels.append(ask_sizes[..., i:i+1])   # v_ask at level i
+        levels.append(bid_prices[..., i:i+1])  # p_bid at level i
+        levels.append(bid_sizes[..., i:i+1])   # v_bid at level i
     
     # Concatenate along feature dimension
     return torch.cat(levels, dim=-1)
@@ -100,7 +115,9 @@ def rearrange_fi2010_to_grouped(
     This is the inverse of rearrange_grouped_to_fi2010.
     
     FI2010:   [p_a0, v_a0, p_b0, v_b0, ..., p_aL-1, v_aL-1, p_bL-1, v_bL-1]
-    GROUPED:  [bid_p(L), ask_p(L), bid_s(L), ask_s(L)]
+              (DeepLOB paper - interleaves per level)
+    GROUPED:  [ask_p(L), ask_s(L), bid_p(L), bid_s(L)]
+              (Rust pipeline output - groups by side, then type)
     
     Args:
         x: Input tensor of shape [..., 4*num_levels]
@@ -133,13 +150,14 @@ def rearrange_fi2010_to_grouped(
         bid_prices.append(x[..., base+2:base+3])    # p_bid at 4i+2
         bid_sizes.append(x[..., base+3:base+4])     # v_bid at 4i+3
     
-    # Concatenate into GROUPED layout
+    # Concatenate into GROUPED layout matching Rust pipeline
+    # [ask_p(L), ask_s(L), bid_p(L), bid_s(L)]
     return torch.cat(
         [
-            torch.cat(bid_prices, dim=-1),  # [*, L]
-            torch.cat(ask_prices, dim=-1),  # [*, L]
-            torch.cat(bid_sizes, dim=-1),   # [*, L]
-            torch.cat(ask_sizes, dim=-1),   # [*, L]
+            torch.cat(ask_prices, dim=-1),  # [*, L] - indices 0:L
+            torch.cat(ask_sizes, dim=-1),   # [*, L] - indices L:2L
+            torch.cat(bid_prices, dim=-1),  # [*, L] - indices 2L:3L
+            torch.cat(bid_sizes, dim=-1),   # [*, L] - indices 3L:4L
         ],
         dim=-1
     )
